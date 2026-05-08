@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+<!-- Add bullets for the next release here. -->
+
+## v3.7.0 (2026-05-08)
 - **Architecture: GameCopilot is now the primary updater.** The host application
   checks `Bennidesign2003/nvidia-mcp/releases/latest` on startup and replaces the
   AppData copy of `server.py` if a newer version (with valid SHA256) is published.
