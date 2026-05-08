@@ -9540,21 +9540,51 @@ def reset_vr_colors(
 
 
 @mcp.tool()
-def check_for_updates() -> dict:
-    """Return the local nvidia-mcp version and whether a newer release is available on GitHub."""
+def check_nvidia_mcp_server_update() -> dict:
+    """Check whether a newer version of the nvidia-mcp SERVER SOFTWARE itself (this MCP server, file: server.py) is available on GitHub.
+
+    USE THIS when the user asks any of:
+      - "Gibt es ein neues Update für den MCP-Server / nvidia-mcp / diesen Server?"
+      - "Is there a new version of the MCP server?"
+      - "Check for nvidia-mcp updates"
+      - "Server aktualisieren?"
+
+    DO NOT USE THIS for: NVIDIA graphics driver updates (use check_and_install_driver),
+    Windows Updates, MSFS patches, ReShade updates, game updates, or any other software.
+    This tool only checks the GitHub Releases of the nvidia-mcp server itself.
+
+    Returns: {"status": "current" | "update_available" | "error", "current_version": "...", "latest_version": "...", ...}
+    """
     return _updater_check()
 
 
 @mcp.tool()
-def apply_update() -> dict:
-    """Download the latest nvidia-mcp release and replace server.py. Restart required to activate."""
+def install_nvidia_mcp_server_update() -> dict:
+    """Download and install the newest version of the nvidia-mcp SERVER SOFTWARE itself (this MCP server, file: server.py).
+
+    USE THIS when the user asks to update the MCP server:
+      - "Update den MCP-Server / installiere die neue Version"
+      - "Install nvidia-mcp update"
+
+    DO NOT USE THIS for: NVIDIA graphics drivers, Windows Updates, or any other software.
+    This tool only updates the nvidia-mcp server itself.
+
+    The new version becomes active on the next server restart. The previous server.py is
+    saved as server.py.bak for rollback. SHA256 of the download is verified before swap.
+    """
     return _updater_apply()
 
 
 @mcp.tool()
-def get_mcp_version() -> dict:
-    """Return the running nvidia-mcp version."""
-    return {"version": __version__}
+def get_nvidia_mcp_server_version() -> dict:
+    """Return the version of the running nvidia-mcp SERVER SOFTWARE itself.
+
+    USE THIS when the user asks: "Welche Version vom MCP-Server läuft?",
+    "What nvidia-mcp version am I running?", "MCP-Server-Version".
+
+    DO NOT USE THIS for the NVIDIA driver version, GPU info, or any other software version.
+    """
+    return {"version": __version__, "repo": "Bennidesign2003/nvidia-mcp"}
 
 
 if __name__ == "__main__":

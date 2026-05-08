@@ -2,7 +2,11 @@
 
 ## Unreleased
 
-<!-- Add bullets for the next release here. publish.sh will rename this section to the new version on release. -->
+- Renamed self-update MCP tools to be unambiguous so the LLM stops confusing them with NVIDIA driver / Windows updates:
+  - `check_for_updates` → `check_nvidia_mcp_server_update`
+  - `apply_update` → `install_nvidia_mcp_server_update`
+  - `get_mcp_version` → `get_nvidia_mcp_server_version`
+- Tool docstrings now explicitly list trigger phrases (DE + EN) and call out which tools NOT to use them in place of.
 
 ## v1.0.0
 
