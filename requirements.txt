@@ -1,0 +1,6 @@
+mcp[cli]
+nvidia-ml-py
+httpx
+py7zr
+rarfile
+websocket-client
