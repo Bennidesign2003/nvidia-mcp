@@ -1,0 +1,8 @@
+{
+  "version": "1.0.0",
+  "tag": "v1.0.0",
+  "download_url": "https://github.com/Bennidesign2003/nvidia-mcp/releases/download/v1.0.0/server.py",
+  "sha256": "54d60bdb70ffb22d68883a910ef2bdc0128c57226cb315ca1299a0c9e04f3a0c",
+  "published_at": "2026-05-08T17:58:55Z",
+  "changelog": "- Initial public release.\n- Self-update mechanism via GitHub Releases (`updater.py`):\n  - Background check on startup, optional auto-apply\n  - SHA256 verification against the release's `update.json`\n  - Atomic file replacement; prior `server.py` kept as `server.py.bak`\n  - Disable with `NVIDIA_MCP_NO_AUTO_UPDATE=1`\n- New MCP tools: `check_for_updates`, `apply_update`, `get_mcp_version`."
+}

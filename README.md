@@ -38,7 +38,24 @@ Disable: set environment variable `NVIDIA_MCP_NO_AUTO_UPDATE=1`.
 
 The update logic is also exposed as MCP tools so the LLM client can drive it explicitly: `check_for_updates`, `apply_update`, `get_mcp_version`.
 
-To publish a new release, bump `__version__` in `updater.py`, append a section to `CHANGELOG.md`, then run `./publish.sh` (requires `gh` CLI authenticated).
+### Releasing a new version
+
+`publish.sh` auto-increments the version, renames the `## Unreleased` section in `CHANGELOG.md` to the new version, commits + pushes the bump, and creates the GitHub release with `server.py` + `update.json`.
+
+```bash
+# 1. Add bullets under "## Unreleased" in CHANGELOG.md
+# 2. Commit your code changes (publish.sh refuses to run with a dirty tree)
+git add -A && git commit -m "..."
+git push
+
+# 3. Pick a bump and publish:
+./publish.sh           # patch (1.0.0 -> 1.0.1) — default
+./publish.sh minor     # 1.0.1 -> 1.1.0
+./publish.sh major     # 1.1.0 -> 2.0.0
+./publish.sh 2.5.0     # explicit version
+```
+
+Existing users pick up the update on their next server start (background check + atomic apply).
 
 ## Logs
 

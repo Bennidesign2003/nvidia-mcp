@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+<!-- Add bullets for the next release here. publish.sh will rename this section to the new version on release. -->
+
 ## v1.0.0
 
 - Initial public release.
