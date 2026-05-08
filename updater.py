@@ -21,7 +21,7 @@ from typing import Any
 
 import httpx
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 GITHUB_REPO = "Bennidesign2003/nvidia-mcp"
 RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+<!-- Add bullets for the next release here. -->
+
+## v1.0.1 (2026-05-08)
 - Renamed self-update MCP tools to be unambiguous so the LLM stops confusing them with NVIDIA driver / Windows updates:
   - `check_for_updates` → `check_nvidia_mcp_server_update`
   - `apply_update` → `install_nvidia_mcp_server_update`
