@@ -4,7 +4,7 @@ set -e
 # ============================================================
 # nvidia-mcp Publish & Release Script
 #
-# Bumps __version__ in updater.py (patch by default, or minor/major
+# Bumps the version markers in server.py (patch by default, or minor/major
 # via $1), renames the "## Unreleased" section in CHANGELOG.md to the
 # new version, commits + pushes the bump, computes server.py SHA256,
 # writes update.json, and creates the GitHub release with both files
@@ -20,7 +20,6 @@ set -e
 
 REPO="Bennidesign2003/nvidia-mcp"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-UPDATER_FILE="${SCRIPT_DIR}/updater.py"
 SERVER_FILE="${SCRIPT_DIR}/server.py"
 CHANGELOG_FILE="${SCRIPT_DIR}/CHANGELOG.md"
 UPDATE_JSON="${SCRIPT_DIR}/update.json"
@@ -36,20 +35,21 @@ if ! gh auth status &>/dev/null; then
     echo "ERROR: not logged into GitHub. gh auth login" >&2
     exit 1
 fi
-if [[ ! -f "${SERVER_FILE}" || ! -f "${UPDATER_FILE}" ]]; then
-    echo "ERROR: server.py or updater.py missing" >&2
+if [[ ! -f "${SERVER_FILE}" ]]; then
+    echo "ERROR: server.py missing" >&2
     exit 1
 fi
-if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain | grep -vE '^.. (CHANGELOG\.md|updater\.py|update\.json)$')" ]]; then
-    echo "ERROR: uncommitted changes (other than CHANGELOG/updater/update.json). Commit or stash first." >&2
+if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain | grep -vE '^.. (CHANGELOG\.md|server\.py|update\.json)$')" ]]; then
+    echo "ERROR: uncommitted changes (other than CHANGELOG/server.py/update.json). Commit or stash first." >&2
     git -C "${SCRIPT_DIR}" status --short
     exit 1
 fi
 
-# --- resolve new version ---
-CURRENT="$(grep -m1 '^__version__' "${UPDATER_FILE}" | sed 's/.*"\(.*\)".*/\1/')"
+# --- resolve new version (read from line 1 of server.py: # __mcp_version__ = "X.Y.Z") ---
+CURRENT="$(head -1 "${SERVER_FILE}" | sed -n 's/^# __mcp_version__ = "\(.*\)"$/\1/p')"
 if [[ -z "${CURRENT}" ]]; then
-    echo "ERROR: could not read __version__ from updater.py" >&2
+    echo "ERROR: server.py line 1 must be '# __mcp_version__ = \"X.Y.Z\"'" >&2
+    head -1 "${SERVER_FILE}" >&2
     exit 1
 fi
 
@@ -77,10 +77,11 @@ echo "=========================================="
 echo "  nvidia-mcp Publish ${CURRENT} -> ${NEW_VERSION}"
 echo "=========================================="
 
-# --- update updater.py ---
-sed -i.bak "s/^__version__ = \"${CURRENT}\"/__version__ = \"${NEW_VERSION}\"/" "${UPDATER_FILE}"
-rm -f "${UPDATER_FILE}.bak"
-echo "  updater.py: __version__ = \"${NEW_VERSION}\""
+# --- update server.py: line 1 marker + __version__ constant ---
+sed -i.bak "1s|^# __mcp_version__ = \"${CURRENT}\"$|# __mcp_version__ = \"${NEW_VERSION}\"|" "${SERVER_FILE}"
+sed -i.bak "s/^__version__ = \"${CURRENT}\"$/__version__ = \"${NEW_VERSION}\"/" "${SERVER_FILE}"
+rm -f "${SERVER_FILE}.bak"
+echo "  server.py: __mcp_version__ + __version__ = \"${NEW_VERSION}\""
 
 # --- update CHANGELOG.md: rename Unreleased -> v1.0.1 (TODAY), add fresh Unreleased ---
 python3 - "${CHANGELOG_FILE}" "${NEW_VERSION}" "${TODAY}" <<'PY'
@@ -110,7 +111,7 @@ print(f"  CHANGELOG.md: Unreleased -> v{new_version} ({today})")
 PY
 
 # --- commit + push the bump ---
-git -C "${SCRIPT_DIR}" add "${UPDATER_FILE}" "${CHANGELOG_FILE}"
+git -C "${SCRIPT_DIR}" add "${SERVER_FILE}" "${CHANGELOG_FILE}"
 git -C "${SCRIPT_DIR}" commit -m "release: v${NEW_VERSION}"
 git -C "${SCRIPT_DIR}" push origin HEAD
 

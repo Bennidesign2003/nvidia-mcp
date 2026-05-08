@@ -32,11 +32,14 @@ The server speaks MCP over stdio. Wire it into your MCP client of choice. GameCo
 
 ## Auto-update
 
-On every start the server checks `https://github.com/Bennidesign2003/nvidia-mcp/releases/latest`. If a newer `server.py` is found, it is downloaded, SHA256-verified against the release's `update.json`, and atomically replaces the local file. The previous `server.py` is kept as `server.py.bak` for rollback. The new version becomes active on the next launch.
+**When used via GameCopilot** (the typical case), the host app checks `Bennidesign2003/nvidia-mcp/releases/latest` on startup and replaces the AppData copy of `server.py` (`%APPDATA%/GameCopilot/mcp-server/server.py`) when a newer release is published, with SHA256 verification.
 
-Disable: set environment variable `NVIDIA_MCP_NO_AUTO_UPDATE=1`.
+**When used standalone** (`python server.py`), the embedded MCP tools handle it:
+- `check_nvidia_mcp_server_update` — read-only check against GitHub Releases
+- `install_nvidia_mcp_server_update` — downloads + atomic replace, restart required
+- `get_nvidia_mcp_server_version` — reports the running version
 
-The update logic is also exposed as MCP tools so the LLM client can drive it explicitly: `check_for_updates`, `apply_update`, `get_mcp_version`.
+Each release ships `server.py` plus an `update.json` containing `{version, download_url, sha256, ...}`. The first line of `server.py` is `# __mcp_version__ = "X.Y.Z"` — that's the canonical version marker and is what GameCopilot's version-aware extraction reads.
 
 ### Releasing a new version
 

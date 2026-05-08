@@ -1,6 +1,8 @@
+# __mcp_version__ = "3.7.0"
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json as _json
 import logging
 import logging.handlers
@@ -13,19 +15,141 @@ import tempfile
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 
 from mcp.server.fastmcp import FastMCP
 import pynvml
 
-from updater import (
-    __version__,
-    apply_update as _updater_apply,
-    check_for_updates as _updater_check,
-    start_background_update_check,
-)
+# ---------------------------------------------------------------------------
+# Self-updater (single-file, read-only check + write apply).
+# When run inside GameCopilot, the host's UpdateService also keeps this file
+# fresh on startup; this code is the standalone fallback so users running
+# `python server.py` directly still benefit from auto-update.
+# ---------------------------------------------------------------------------
+__version__ = "3.7.0"
+_GITHUB_REPO = "Bennidesign2003/nvidia-mcp"
+_RELEASE_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
+_SCRIPT_DIR = Path(__file__).parent.resolve()
+_SERVER_FILE = _SCRIPT_DIR / "server.py"
+_BACKUP_FILE = _SCRIPT_DIR / "server.py.bak"
+
+
+def _updater_parse_version(s: str) -> tuple[int, ...]:
+    s = s.lstrip("v").strip()
+    out: list[int] = []
+    for p in s.split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            break
+    return tuple(out)
+
+
+def _updater_is_newer(remote: str, local: str = __version__) -> bool:
+    r = _updater_parse_version(remote)
+    return bool(r) and r > _updater_parse_version(local)
+
+
+def _updater_fetch_latest_release() -> dict[str, Any] | None:
+    headers = {"Accept": "application/vnd.github+json"}
+    token = os.environ.get("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with httpx.Client(timeout=10.0, follow_redirects=True) as c:
+            r = c.get(_RELEASE_API, headers=headers)
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+
+def _updater_find_asset_url(release: dict[str, Any], name: str) -> str | None:
+    for a in release.get("assets", []):
+        if a.get("name") == name:
+            return a.get("browser_download_url")
+    return None
+
+
+def _updater_sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _updater_check() -> dict[str, Any]:
+    release = _updater_fetch_latest_release()
+    if not release:
+        return {"status": "error", "message": "Could not reach GitHub Releases API"}
+    remote = (release.get("tag_name") or "").lstrip("v")
+    if not remote:
+        return {"status": "error", "message": "Latest release has no tag_name"}
+    if not _updater_is_newer(remote):
+        return {"status": "current", "current_version": __version__, "latest_version": remote}
+    return {
+        "status": "update_available",
+        "current_version": __version__,
+        "latest_version": remote,
+        "release_url": release.get("html_url"),
+        "release_notes": release.get("body", "") or "",
+    }
+
+
+def _updater_apply() -> dict[str, Any]:
+    release = _updater_fetch_latest_release()
+    if not release:
+        return {"status": "error", "message": "Could not reach GitHub Releases API"}
+    remote = (release.get("tag_name") or "").lstrip("v")
+    if not _updater_is_newer(remote):
+        return {"status": "already_current", "version": __version__}
+    server_url = _updater_find_asset_url(release, "server.py")
+    update_json_url = _updater_find_asset_url(release, "update.json")
+    if not server_url:
+        return {"status": "error", "message": "Release is missing server.py asset"}
+
+    expected_sha: str | None = None
+    if update_json_url:
+        try:
+            with httpx.Client(timeout=10.0, follow_redirects=True) as c:
+                r = c.get(update_json_url)
+                r.raise_for_status()
+                expected_sha = r.json().get("sha256")
+        except Exception:
+            pass
+
+    fd, tmp_path_str = tempfile.mkstemp(prefix="server-", suffix=".py.new", dir=_SCRIPT_DIR)
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
+    try:
+        with httpx.Client(timeout=120.0, follow_redirects=True) as c:
+            with c.stream("GET", server_url) as r:
+                r.raise_for_status()
+                with tmp_path.open("wb") as f:
+                    for chunk in r.iter_bytes(65536):
+                        f.write(chunk)
+        if expected_sha:
+            actual = _updater_sha256_of(tmp_path)
+            if actual.lower() != expected_sha.lower():
+                tmp_path.unlink(missing_ok=True)
+                return {"status": "error", "message": f"SHA256 mismatch (expected {expected_sha}, got {actual})"}
+        if _SERVER_FILE.exists():
+            shutil.copy2(_SERVER_FILE, _BACKUP_FILE)
+        os.replace(tmp_path, _SERVER_FILE)
+        return {
+            "status": "updated",
+            "previous_version": __version__,
+            "new_version": remote,
+            "restart_required": True,
+            "backup": str(_BACKUP_FILE),
+        }
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        return {"status": "error", "message": str(e)}
+
 
 mcp = FastMCP("nvidia-gpu")
 
@@ -9553,6 +9677,10 @@ def check_nvidia_mcp_server_update() -> dict:
     Windows Updates, MSFS patches, ReShade updates, game updates, or any other software.
     This tool only checks the GitHub Releases of the nvidia-mcp server itself.
 
+    Note: when running inside GameCopilot, the host application also updates this server
+    automatically on each launch — the user does not need to run install_nvidia_mcp_server_update
+    manually unless running this MCP server standalone.
+
     Returns: {"status": "current" | "update_available" | "error", "current_version": "...", "latest_version": "...", ...}
     """
     return _updater_check()
@@ -9571,6 +9699,9 @@ def install_nvidia_mcp_server_update() -> dict:
 
     The new version becomes active on the next server restart. The previous server.py is
     saved as server.py.bak for rollback. SHA256 of the download is verified before swap.
+
+    Note: when running inside GameCopilot, this is normally handled automatically by the
+    host on each launch — only call this for an immediate manual update.
     """
     return _updater_apply()
 
@@ -9584,9 +9715,8 @@ def get_nvidia_mcp_server_version() -> dict:
 
     DO NOT USE THIS for the NVIDIA driver version, GPU info, or any other software version.
     """
-    return {"version": __version__, "repo": "Bennidesign2003/nvidia-mcp"}
+    return {"version": __version__, "repo": _GITHUB_REPO}
 
 
 if __name__ == "__main__":
-    start_background_update_check()
     mcp.run()
