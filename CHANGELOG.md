@@ -4,6 +4,9 @@
 
 <!-- Add bullets for the next release here. -->
 
+## v3.8.2 (2026-05-09)
+<!-- Add bullets for the next release here. -->
+
 ## v3.8.1 (2026-05-09)
 ### Update tools — labeled responses
 - Every update-related tool now returns `kind` (`"mcp_server"` |

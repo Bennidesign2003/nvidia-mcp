@@ -1,4 +1,4 @@
-# __mcp_version__ = "3.8.1"
+# __mcp_version__ = "3.8.2"
 from __future__ import annotations
 
 import datetime
@@ -38,7 +38,7 @@ except ImportError:
 # fresh on startup; this code is the standalone fallback so users running
 # `python server.py` directly still benefit from auto-update.
 # ---------------------------------------------------------------------------
-__version__ = "3.8.1"
+__version__ = "3.8.2"
 _GITHUB_REPO = "Bennidesign2003/nvidia-mcp"
 _RELEASE_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 _SCRIPT_DIR = Path(__file__).parent.resolve()
