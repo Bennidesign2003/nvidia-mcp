@@ -1,6 +1,8 @@
-mcp[cli]
-nvidia-ml-py
-httpx
-py7zr
-rarfile
-websocket-client
+# Pinned to known-good versions. A breaking change in fastmcp's tool API would
+# brick every already-deployed copy of server.py — pins keep that local.
+mcp[cli]~=1.27.0
+nvidia-ml-py~=13.595
+httpx~=0.28.1
+py7zr~=1.1.0
+rarfile~=4.2
+websocket-client~=1.8

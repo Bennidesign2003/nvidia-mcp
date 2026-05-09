@@ -45,6 +45,22 @@ if [[ -n "$(git -C "${SCRIPT_DIR}" status --porcelain | grep -vE '^.. (CHANGELOG
     exit 1
 fi
 
+# --- preflight: compile + smoke-test before tagging anything ---
+PYTHON_BIN="${SCRIPT_DIR}/.venv/bin/python"
+if [[ ! -x "${PYTHON_BIN}" ]]; then
+    PYTHON_BIN="$(command -v python3 || command -v python)"
+fi
+if [[ -n "${PYTHON_BIN}" ]]; then
+    echo "  preflight: py_compile..."
+    "${PYTHON_BIN}" -m py_compile "${SERVER_FILE}" || { echo "ERROR: server.py has syntax errors"; exit 1; }
+    if [[ -f "${SCRIPT_DIR}/tests/test_smoke.py" ]]; then
+        echo "  preflight: smoke tests..."
+        "${PYTHON_BIN}" "${SCRIPT_DIR}/tests/test_smoke.py" || { echo "ERROR: smoke tests failed"; exit 1; }
+    fi
+else
+    echo "  WARN: no python found, skipping preflight checks"
+fi
+
 # --- resolve new version (read from line 1 of server.py: # __mcp_version__ = "X.Y.Z") ---
 CURRENT="$(head -1 "${SERVER_FILE}" | sed -n 's/^# __mcp_version__ = "\(.*\)"$/\1/p')"
 if [[ -z "${CURRENT}" ]]; then

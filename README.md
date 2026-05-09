@@ -4,7 +4,7 @@ MCP server (`FastMCP` name: `nvidia-gpu`) used by [GameCopilot](https://github.c
 
 ## What it does
 
-49 tools across these areas:
+58 tools, 5 resources, 3 prompts across these areas:
 
 - **Hardware** — `get_gpu_status`, `get_system_info`, NVIDIA driver check + install
 - **MSFS 2024** — read / write `UserCfg.opt`, fix shader cache, repair install
@@ -12,6 +12,14 @@ MCP server (`FastMCP` name: `nvidia-gpu`) used by [GameCopilot](https://github.c
 - **ReShade** — list presets, toggle effects, set per-effect uniforms
 - **Windows** — user account management, firewall rules, process control, file ops
 - **Browser automation** — open URLs, query DOM, fill forms (for AI-driven setup flows)
+
+Resources expose read-only views (`nvidia-mcp://gpu-status`, `nvidia-mcp://msfs-usercfg`, `nvidia-mcp://changelog`, `nvidia-mcp://version`, `nvidia-mcp://server-log`) so the LLM can answer "show me my settings" without burning tool-call tokens. Prompts (`optimize_msfs_for_vr`, `diagnose_msfs_issue`, `check_for_server_updates`) are canned multi-step playbooks the host can offer as starter prompts.
+
+## Security
+
+- `run_shell_command` is **disabled by default** — set `NVIDIA_MCP_ALLOW_SHELL=1` to enable. Every invocation is logged to `server.log`. A prompt-injection through any web page the LLM reads can pivot into RCE if this is enabled, so leave it off unless you really need it.
+- Untrusted strings (process names, registry paths, user input) are bound via env vars (`$env:NVMCP_ARG0`) into PowerShell scripts rather than f-string-interpolated, so a value like `'; Remove-Item C:\` is just a string and can't break out of the command.
+- Browser automation (`browser_click`, `browser_type`) launches Chrome with a **dedicated user-data-dir** (`%LOCALAPPDATA%\GameCopilot\chrome-cdp`) so it never interferes with the user's regular Chrome session. Set `NVIDIA_MCP_CDP_USE_MAIN_PROFILE=1` to opt back into the legacy "kill+relaunch user's Chrome" behavior.
 
 ## Install
 
@@ -66,4 +74,4 @@ Runtime logs land in `server.log` next to `server.py`.
 
 ## License
 
-Internal / personal project. Not yet a public-license release.
+Source-available, not yet under a formal open-source license. The repo is public so GameCopilot users can audit `server.py` before it executes on their machine. Reach out before redistributing.
