@@ -119,21 +119,44 @@ def _updater_sha256_of(path: Path) -> str:
     return h.hexdigest()
 
 
+# Stable labels for the GameCopilot host so it can route notifications
+# correctly ("MCP-Server-Update" vs "NVIDIA-Treiber-Update" vs "GameCopilot-App-Update"
+# vs "Windows-Update"). The `kind` field is the machine-readable key, the
+# `component` field is the human label, and the `message` field is a
+# pre-formatted string the LLM/UI should display verbatim.
+_KIND_MCP_SERVER = "mcp_server"
+_COMPONENT_MCP_SERVER = "nvidia-mcp Server"
+_KIND_NVIDIA_DRIVER = "nvidia_driver"
+_COMPONENT_NVIDIA_DRIVER = "NVIDIA-Treiber"
+
+
 def _updater_check() -> dict[str, Any]:
+    base = {"kind": _KIND_MCP_SERVER, "component": _COMPONENT_MCP_SERVER}
     release = _updater_fetch_latest_release()
     if not release:
-        return {"status": "error", "message": "Could not reach GitHub Releases API"}
+        return {
+            **base, "status": "error",
+            "message": f"{_COMPONENT_MCP_SERVER}: Update-Check fehlgeschlagen (GitHub API nicht erreichbar)",
+        }
     remote = (release.get("tag_name") or "").lstrip("v")
     if not remote:
-        return {"status": "error", "message": "Latest release has no tag_name"}
+        return {
+            **base, "status": "error",
+            "message": f"{_COMPONENT_MCP_SERVER}: Update-Check fehlgeschlagen (Release ohne tag_name)",
+        }
     if not _updater_is_newer(remote):
-        return {"status": "current", "current_version": __version__, "latest_version": remote}
+        return {
+            **base, "status": "current",
+            "current_version": __version__, "latest_version": remote,
+            "message": f"{_COMPONENT_MCP_SERVER}: aktuell ({__version__})",
+        }
     return {
-        "status": "update_available",
+        **base, "status": "update_available",
         "current_version": __version__,
         "latest_version": remote,
         "release_url": release.get("html_url"),
         "release_notes": release.get("body", "") or "",
+        "message": f"{_COMPONENT_MCP_SERVER}: Update verfügbar ({__version__} → {remote})",
     }
 
 
@@ -150,16 +173,26 @@ def _updater_cleanup_stale() -> None:
 
 
 def _updater_apply() -> dict[str, Any]:
+    base = {"kind": _KIND_MCP_SERVER, "component": _COMPONENT_MCP_SERVER}
     release = _updater_fetch_latest_release()
     if not release:
-        return {"status": "error", "message": "Could not reach GitHub Releases API"}
+        return {
+            **base, "status": "error",
+            "message": f"{_COMPONENT_MCP_SERVER}: Update fehlgeschlagen (GitHub API nicht erreichbar)",
+        }
     remote = (release.get("tag_name") or "").lstrip("v")
     if not _updater_is_newer(remote):
-        return {"status": "already_current", "version": __version__}
+        return {
+            **base, "status": "already_current", "version": __version__,
+            "message": f"{_COMPONENT_MCP_SERVER}: bereits aktuell ({__version__})",
+        }
     server_url = _updater_find_asset_url(release, "server.py")
     update_json_url = _updater_find_asset_url(release, "update.json")
     if not server_url:
-        return {"status": "error", "message": "Release is missing server.py asset"}
+        return {
+            **base, "status": "error",
+            "message": f"{_COMPONENT_MCP_SERVER}: Update fehlgeschlagen (Release ohne server.py-Asset)",
+        }
 
     expected_sha: str | None = None
     if update_json_url:
@@ -185,19 +218,32 @@ def _updater_apply() -> dict[str, Any]:
         if expected_sha:
             actual = _updater_sha256_of(tmp_path)
             if actual.lower() != expected_sha.lower():
-                return {"status": "error", "message": f"SHA256 mismatch (expected {expected_sha}, got {actual})"}
+                return {
+                    **base, "status": "error",
+                    "message": (
+                        f"{_COMPONENT_MCP_SERVER}: Update fehlgeschlagen "
+                        f"(SHA256-Mismatch — erwartet {expected_sha}, bekommen {actual})"
+                    ),
+                }
         if _SERVER_FILE.exists():
             shutil.copy2(_SERVER_FILE, _BACKUP_FILE)
         os.replace(tmp_path, _SERVER_FILE)
         return {
-            "status": "updated",
+            **base, "status": "updated",
             "previous_version": __version__,
             "new_version": remote,
             "restart_required": True,
             "backup": str(_BACKUP_FILE),
+            "message": (
+                f"{_COMPONENT_MCP_SERVER}: Update installiert "
+                f"({__version__} → {remote}, Neustart erforderlich)"
+            ),
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return {
+            **base, "status": "error",
+            "message": f"{_COMPONENT_MCP_SERVER}: Update fehlgeschlagen ({e})",
+        }
     finally:
         # Idempotent: succeeds whether os.replace consumed the tmp or it's still present.
         try:
@@ -2208,12 +2254,26 @@ def check_and_install_driver(
     auto_install: bool = False,
     download_dir: str = "",
 ) -> dict:
-    """Check the installed NVIDIA driver against the latest available version.
+    """Check the installed NVIDIA GRAPHICS DRIVER against the latest available version.
 
     Reads the current driver version and GPU model via NVML, then queries
     the NVIDIA driver API for the newest WHQL-certified driver.  Returns a
     comparison and the download link.  If *auto_install* is True the
     installer is downloaded and launched in silent mode (``/s /noreboot``).
+
+    USE THIS when the user asks about NVIDIA / GPU / display driver updates:
+      - "Gibt es einen neuen NVIDIA-Treiber?"
+      - "GPU driver update?" / "Treiber aktuell?"
+
+    DO NOT USE THIS for: nvidia-mcp server updates (use check_nvidia_mcp_server_update),
+    Windows Updates, GameCopilot host-app updates. This tool only checks the
+    NVIDIA graphics driver from nvidia.com.
+
+    Returns include `kind: "nvidia_driver"`, `component: "NVIDIA-Treiber"`,
+    `status` ("current" | "update_available" | "installing" | "error"), and a
+    pre-formatted `message` — report that message verbatim. Never collapse
+    into a generic "update available"; always name the component so an MCP
+    server / app / Windows update can be told apart.
 
     Args:
         auto_install: If True, download the installer and run it silently.
@@ -2221,11 +2281,17 @@ def check_and_install_driver(
         download_dir: Directory to save the downloaded installer.
                       Defaults to the user's Downloads folder.
     """
+    base = {"kind": _KIND_NVIDIA_DRIVER, "component": _COMPONENT_NVIDIA_DRIVER}
+
     # 1. Current driver info via NVML
     try:
         current_version, gpu_name = _get_gpu_info()
     except Exception as exc:
-        return {"error": f"Could not read GPU info via NVML: {exc}"}
+        return {
+            **base, "status": "error",
+            "error": f"Could not read GPU info via NVML: {exc}",
+            "message": f"{_COMPONENT_NVIDIA_DRIVER}: Update-Check fehlgeschlagen (NVML: {exc})",
+        }
 
     # 2. Map GPU name to NVIDIA API parameters (dynamic lookup, then static)
     ids = _lookup_pfid(gpu_name)
@@ -2233,12 +2299,14 @@ def check_and_install_driver(
         ids = _match_gpu_model(gpu_name)
     if ids is None:
         return {
+            **base, "status": "error",
             "error": (
                 f"GPU '{gpu_name}' not found via NVIDIA API or static table. "
                 "Check manually at: https://www.nvidia.com/Download/index.aspx"
             ),
             "current_driver": current_version,
             "gpu_name": gpu_name,
+            "message": f"{_COMPONENT_NVIDIA_DRIVER}: GPU '{gpu_name}' nicht in NVIDIA-Lookup gefunden",
         }
     psid, pfid = ids
 
@@ -2247,22 +2315,27 @@ def check_and_install_driver(
         latest = _query_latest_driver(psid, pfid)
     except Exception as exc:
         return {
+            **base, "status": "error",
             "error": f"NVIDIA API request failed: {exc}",
             "current_driver": current_version,
             "gpu_name": gpu_name,
+            "message": f"{_COMPONENT_NVIDIA_DRIVER}: Update-Check fehlgeschlagen (NVIDIA API: {exc})",
         }
 
     if latest is None:
         return {
+            **base, "status": "error",
             "error": "Could not parse a driver version from the NVIDIA API response.",
             "current_driver": current_version,
             "gpu_name": gpu_name,
+            "message": f"{_COMPONENT_NVIDIA_DRIVER}: Update-Check fehlgeschlagen (NVIDIA API-Antwort unleserlich)",
         }
 
     # 4. Compare versions
     up_to_date = _version_tuple(current_version) >= _version_tuple(latest["version"])
 
     result: dict = {
+        **base,
         "gpu_name": gpu_name,
         "current_driver": current_version,
         "latest_driver": latest["version"],
@@ -2273,11 +2346,14 @@ def check_and_install_driver(
     }
 
     if up_to_date:
-        result["message"] = "Your driver is already up to date."
+        result["status"] = "current"
+        result["message"] = f"{_COMPONENT_NVIDIA_DRIVER}: aktuell ({current_version})"
         return result
 
+    result["status"] = "update_available"
     result["message"] = (
-        f"Update available: {current_version} -> {latest['version']}"
+        f"{_COMPONENT_NVIDIA_DRIVER}: Update verfügbar "
+        f"({current_version} → {latest['version']})"
     )
 
     if not auto_install:
@@ -2291,6 +2367,7 @@ def check_and_install_driver(
         installer = _download(latest["download_url"], dl_dir)
     except Exception as exc:
         result["install_error"] = f"Download failed: {exc}"
+        result["message"] = f"{_COMPONENT_NVIDIA_DRIVER}: Installer-Download fehlgeschlagen ({exc})"
         return result
 
     result["installer_path"] = str(installer)
@@ -2304,14 +2381,19 @@ def check_and_install_driver(
         )
         result["install_status"] = "installer_started"
         result["installer_pid"] = proc.pid
+        result["status"] = "installing"
         result["message"] = (
-            f"Installer launched in silent mode (PID {proc.pid}). "
-            "A reboot may be required after installation completes."
+            f"{_COMPONENT_NVIDIA_DRIVER}: Installer gestartet (PID {proc.pid}, "
+            f"{current_version} → {latest['version']}, Reboot ggf. nötig)"
         )
     except Exception as exc:
         result["install_error"] = (
             f"Could not launch installer: {exc}. "
             "Try running as administrator."
+        )
+        result["message"] = (
+            f"{_COMPONENT_NVIDIA_DRIVER}: Installer-Start fehlgeschlagen "
+            f"({exc} — als Administrator ausführen?)"
         )
 
     return result
@@ -9882,14 +9964,22 @@ def check_nvidia_mcp_server_update() -> dict:
       - "Server aktualisieren?"
 
     DO NOT USE THIS for: NVIDIA graphics driver updates (use check_and_install_driver),
-    Windows Updates, MSFS patches, ReShade updates, game updates, or any other software.
-    This tool only checks the GitHub Releases of the nvidia-mcp server itself.
+    Windows Updates, MSFS patches, ReShade updates, GameCopilot host-app updates,
+    or any other software. This tool only checks the GitHub Releases of the
+    nvidia-mcp server itself.
 
     Note: when running inside GameCopilot, the host application also updates this server
     automatically on each launch — the user does not need to run install_nvidia_mcp_server_update
     manually unless running this MCP server standalone.
 
-    Returns: {"status": "current" | "update_available" | "error", "current_version": "...", "latest_version": "...", ...}
+    Returns: {"kind": "mcp_server", "component": "nvidia-mcp Server",
+              "status": "current" | "update_available" | "error",
+              "current_version": "...", "latest_version": "...",
+              "message": "<pre-formatted user-facing string>"}.
+    The `message` field is already specific to this component — report it
+    verbatim to the user. Never collapse it into a generic "update available";
+    always include the component name so a separate driver / app / Windows
+    update can be told apart.
     """
     return _updater_check()
 
@@ -9902,11 +9992,17 @@ def install_nvidia_mcp_server_update() -> dict:
       - "Update den MCP-Server / installiere die neue Version"
       - "Install nvidia-mcp update"
 
-    DO NOT USE THIS for: NVIDIA graphics drivers, Windows Updates, or any other software.
-    This tool only updates the nvidia-mcp server itself.
+    DO NOT USE THIS for: NVIDIA graphics drivers, Windows Updates, GameCopilot
+    host-app updates, or any other software. This tool only updates the
+    nvidia-mcp server itself.
 
     The new version becomes active on the next server restart. The previous server.py is
     saved as server.py.bak for rollback. SHA256 of the download is verified before swap.
+
+    Returns include `kind: "mcp_server"`, `component: "nvidia-mcp Server"`,
+    and a pre-formatted `message` — report that message verbatim and always
+    name the component so a separate driver / app / Windows update can't be
+    confused with this one.
 
     Note: when running inside GameCopilot, this is normally handled automatically by the
     host on each launch — only call this for an immediate manual update.
@@ -9923,7 +10019,69 @@ def get_nvidia_mcp_server_version() -> dict:
 
     DO NOT USE THIS for the NVIDIA driver version, GPU info, or any other software version.
     """
-    return {"version": __version__, "repo": _GITHUB_REPO}
+    return {
+        "kind": _KIND_MCP_SERVER,
+        "component": _COMPONENT_MCP_SERVER,
+        "version": __version__,
+        "repo": _GITHUB_REPO,
+        "message": f"{_COMPONENT_MCP_SERVER}: Version {__version__}",
+    }
+
+
+@mcp.tool()
+def check_all_updates() -> dict:
+    """One call that checks every update source the MCP server knows about.
+
+    Currently aggregates: nvidia-mcp Server (GitHub Releases) and the NVIDIA
+    graphics driver. Each entry is labeled with `kind` ("mcp_server",
+    "nvidia_driver"), `component` (human label), `status` ("current",
+    "update_available", "error"), and a pre-formatted `message`. The LLM /
+    UI should report each entry with its own component label so the user
+    can see WHICH thing has an update — never collapse them into a generic
+    "update available".
+
+    USE THIS when the user asks generically:
+      - "Sind Updates verfügbar?" / "Was muss ich aktualisieren?"
+      - "Check for updates" / "Any updates pending?"
+
+    DOES NOT include: GameCopilot host-app updates (the host runs its own
+    self-update against its own GitHub repo — separate channel), Windows
+    Updates (use windows_update_status), MSFS patches.
+    """
+    out: list[dict] = []
+
+    # 1. nvidia-mcp Server itself
+    try:
+        out.append(_updater_check())
+    except Exception as exc:
+        out.append({
+            "kind": _KIND_MCP_SERVER,
+            "component": _COMPONENT_MCP_SERVER,
+            "status": "error",
+            "message": f"{_COMPONENT_MCP_SERVER}: Update-Check fehlgeschlagen ({exc})",
+        })
+
+    # 2. NVIDIA driver
+    try:
+        driver = check_and_install_driver(auto_install=False)
+        # Defensive: ensure label fields are present even if an old code path returned without them
+        driver.setdefault("kind", _KIND_NVIDIA_DRIVER)
+        driver.setdefault("component", _COMPONENT_NVIDIA_DRIVER)
+        out.append(driver)
+    except Exception as exc:
+        out.append({
+            "kind": _KIND_NVIDIA_DRIVER,
+            "component": _COMPONENT_NVIDIA_DRIVER,
+            "status": "error",
+            "message": f"{_COMPONENT_NVIDIA_DRIVER}: Update-Check fehlgeschlagen ({exc})",
+        })
+
+    available = [u for u in out if u.get("status") == "update_available"]
+    summary = (
+        "Alle Komponenten aktuell." if not available else
+        "Updates verfügbar: " + ", ".join(u.get("component", u.get("kind", "?")) for u in available)
+    )
+    return {"updates": out, "summary": summary, "any_update_available": bool(available)}
 
 
 # ---------------------------------------------------------------------------

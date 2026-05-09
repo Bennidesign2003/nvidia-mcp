@@ -2,7 +2,25 @@
 
 ## Unreleased
 
-<!-- Add bullets for the next release here. -->
+### Update tools — labeled responses
+- Every update-related tool now returns `kind` (`"mcp_server"` |
+  `"nvidia_driver"`), `component` (human label), `status`, and a
+  pre-formatted `message` so GameCopilot's notification UI / the LLM can
+  always say WHICH thing has the update — never a generic "Update verfügbar".
+  Examples:
+  - `nvidia-mcp Server: Update verfügbar (3.8.0 → 3.8.1)`
+  - `NVIDIA-Treiber: aktuell (572.16)`
+- New `check_all_updates` tool: one call, aggregates nvidia-mcp + NVIDIA
+  driver into a single labeled list. Useful when the user asks the generic
+  "sind Updates verfügbar?" without naming a component.
+- `check_and_install_driver` returns `kind: "nvidia_driver"` and a
+  pre-formatted German `message`.
+- `check_nvidia_mcp_server_update` / `install_nvidia_mcp_server_update` /
+  `get_nvidia_mcp_server_version` returns include `kind: "mcp_server"` and a
+  pre-formatted `message`.
+- Docstrings instruct the LLM to report the `message` verbatim and always
+  name the component, so a separate driver / Windows / GameCopilot-app
+  update can never be confused with an MCP-server update.
 
 ## v3.8.0 (2026-05-09)
 ### Security

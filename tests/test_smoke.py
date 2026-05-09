@@ -51,6 +51,23 @@ class SmokeTest(unittest.TestCase):
         result = server.get_gpu_status(0)
         self.assertIsInstance(result, dict)
 
+    def test_version_response_is_labeled(self) -> None:
+        # Update-related returns must carry kind/component/message so the LLM
+        # never confuses this with an NVIDIA-driver / Windows / app update.
+        v = server.get_nvidia_mcp_server_version()
+        self.assertEqual(v["kind"], "mcp_server")
+        self.assertIn("nvidia-mcp", v["component"])
+        self.assertIn(server.__version__, v["message"])
+
+    def test_check_all_updates_aggregates(self) -> None:
+        result = server.check_all_updates()
+        self.assertIn("updates", result)
+        self.assertIn("summary", result)
+        kinds = [u.get("kind") for u in result["updates"]]
+        # Both update sources must be represented even if individual checks errored.
+        self.assertIn("mcp_server", kinds)
+        self.assertIn("nvidia_driver", kinds)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
