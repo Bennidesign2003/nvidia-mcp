@@ -4,6 +4,59 @@
 
 <!-- Add bullets for the next release here. -->
 
+## v3.8.0 (2026-05-09)
+### Security
+- **PowerShell command-injection fixed in 9 tools.** `manage_processes`,
+  `manage_services`, `network_diagnostics`, `manage_startup_programs`,
+  `manage_firewall`, `disk_analysis`, `manage_installed_software`,
+  `manage_users` (incl. password), `manage_scheduled_tasks` no longer build
+  PowerShell strings via f-string interpolation. Untrusted values are now
+  bound through env vars (`$env:NVMCP_ARG0`) — a value like `'; rm -rf /` is
+  just a string and cannot break out of the command.
+- **`browser_click` / `browser_type` JS-injection fixed.** Selector and text
+  arguments are JSON-encoded and passed via `Function.apply` instead of being
+  string-interpolated into JS source.
+- **`run_shell_command` is now opt-in.** Set `NVIDIA_MCP_ALLOW_SHELL=1` to
+  enable. Every invocation is logged to `server.log`. Default-deny because a
+  prompt-injection through any web page the LLM reads can pivot into RCE.
+- **Browser CDP no longer kills the user's main Chrome.** A separate
+  user-data-dir (`%LOCALAPPDATA%\GameCopilot\chrome-cdp`) is used by default.
+  Set `NVIDIA_MCP_CDP_USE_MAIN_PROFILE=1` to opt back into the legacy
+  kill+relaunch behavior.
+
+### Robustness
+- `pynvml` is now lazy-imported. Server starts on systems without an NVIDIA
+  driver (CI, dev, non-NV hardware); GPU tools return a structured error.
+- `get_gpu_status` now catches NVML init failures.
+- Update check has a 5-minute cache to avoid hammering the GitHub API on
+  repeated LLM checks.
+- Updater always cleans up its `.new` temp files via `finally`, plus removes
+  any stale ones from earlier aborted runs before downloading.
+- Logging falls back to `%TEMP%\nvidia-mcp.log` when `server.log` next to
+  `server.py` is on a read-only mount.
+- Best-effort version-drift check at startup: warns on stderr if line 1's
+  `# __mcp_version__` doesn't match `__version__`.
+
+### MCP API surface
+- **5 new resources** for read-only views (no tool call needed):
+  `nvidia-mcp://version`, `nvidia-mcp://changelog`, `nvidia-mcp://gpu-status`,
+  `nvidia-mcp://msfs-usercfg`, `nvidia-mcp://server-log`.
+- **3 new prompts** (canned playbooks): `optimize_msfs_for_vr`,
+  `diagnose_msfs_issue`, `check_for_server_updates`.
+
+### Dev / release
+- Pinned dependency versions in `requirements.txt`.
+- New `tests/test_smoke.py` — smoke-test that imports server.py, verifies tool
+  / resource / prompt counts, and checks security defaults.
+- New `.github/workflows/ci.yml` — runs py_compile + smoke tests on every push.
+- `publish.sh` now runs py_compile + smoke tests as a preflight before
+  tagging a release. Refuses to release a server.py with syntax errors.
+
+### Deferred to a future release
+- Splitting `server.py` (~9700 lines) into a `nvidia_mcp/` package with a
+  build step that bundles back to a single file for GameCopilot's extractor.
+  Postponed until a proper test suite exists to catch regressions.
+
 ## v3.7.0 (2026-05-08)
 - **Architecture: GameCopilot is now the primary updater.** The host application
   checks `Bennidesign2003/nvidia-mcp/releases/latest` on startup and replaces the

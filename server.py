@@ -1,4 +1,4 @@
-# __mcp_version__ = "3.7.0"
+# __mcp_version__ = "3.8.0"
 from __future__ import annotations
 
 import datetime
@@ -11,7 +11,9 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time as _time
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
@@ -20,7 +22,15 @@ from typing import Any, Literal
 import httpx
 
 from mcp.server.fastmcp import FastMCP
-import pynvml
+
+# pynvml is required only by the GPU-related tools. Lazy-import it so the
+# server still starts on systems without an NVIDIA driver (CI / dev / non-NV
+# hardware) — gpu tools will return a structured error instead of crashing
+# the whole import.
+try:
+    import pynvml  # type: ignore
+except ImportError:
+    pynvml = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Self-updater (single-file, read-only check + write apply).
@@ -28,12 +38,33 @@ import pynvml
 # fresh on startup; this code is the standalone fallback so users running
 # `python server.py` directly still benefit from auto-update.
 # ---------------------------------------------------------------------------
-__version__ = "3.7.0"
+__version__ = "3.8.0"
 _GITHUB_REPO = "Bennidesign2003/nvidia-mcp"
 _RELEASE_API = f"https://api.github.com/repos/{_GITHUB_REPO}/releases/latest"
 _SCRIPT_DIR = Path(__file__).parent.resolve()
 _SERVER_FILE = _SCRIPT_DIR / "server.py"
 _BACKUP_FILE = _SCRIPT_DIR / "server.py.bak"
+
+# Best-effort sanity check: line 1 marker (read by GameCopilot + publish.sh)
+# must match __version__. Drift here means publish.sh is buggy — surface it.
+try:
+    with open(__file__, "r", encoding="utf-8") as _vf:
+        _first_line = _vf.readline().strip()
+    _expected = f'# __mcp_version__ = "{__version__}"'
+    if _first_line != _expected:
+        print(
+            f"WARN: nvidia-mcp version drift — line 1 = {_first_line!r}, "
+            f"__version__ = {__version__!r}",
+            file=sys.stderr,
+        )
+    del _vf, _first_line, _expected
+except Exception:
+    pass
+
+# Cache for the GitHub Releases API (avoid hitting rate limits when an LLM
+# checks for updates repeatedly).
+_UPDATER_CACHE: dict[str, Any] = {"ts": 0.0, "data": None}
+_UPDATER_CACHE_TTL = 300.0  # 5 minutes
 
 
 def _updater_parse_version(s: str) -> tuple[int, ...]:
@@ -53,6 +84,10 @@ def _updater_is_newer(remote: str, local: str = __version__) -> bool:
 
 
 def _updater_fetch_latest_release() -> dict[str, Any] | None:
+    now = _time.time()
+    cached = _UPDATER_CACHE.get("data")
+    if cached is not None and (now - float(_UPDATER_CACHE.get("ts", 0.0))) < _UPDATER_CACHE_TTL:
+        return cached  # type: ignore[return-value]
     headers = {"Accept": "application/vnd.github+json"}
     token = os.environ.get("GITHUB_TOKEN")
     if token:
@@ -61,7 +96,10 @@ def _updater_fetch_latest_release() -> dict[str, Any] | None:
         with httpx.Client(timeout=10.0, follow_redirects=True) as c:
             r = c.get(_RELEASE_API, headers=headers)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+        _UPDATER_CACHE["ts"] = now
+        _UPDATER_CACHE["data"] = data
+        return data
     except Exception:
         return None
 
@@ -99,6 +137,18 @@ def _updater_check() -> dict[str, Any]:
     }
 
 
+def _updater_cleanup_stale() -> None:
+    """Remove orphaned `server-*.py.new` files left behind by aborted updates."""
+    try:
+        for stale in _SCRIPT_DIR.glob("server-*.py.new"):
+            try:
+                stale.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _updater_apply() -> dict[str, Any]:
     release = _updater_fetch_latest_release()
     if not release:
@@ -121,6 +171,7 @@ def _updater_apply() -> dict[str, Any]:
         except Exception:
             pass
 
+    _updater_cleanup_stale()
     fd, tmp_path_str = tempfile.mkstemp(prefix="server-", suffix=".py.new", dir=_SCRIPT_DIR)
     os.close(fd)
     tmp_path = Path(tmp_path_str)
@@ -134,7 +185,6 @@ def _updater_apply() -> dict[str, Any]:
         if expected_sha:
             actual = _updater_sha256_of(tmp_path)
             if actual.lower() != expected_sha.lower():
-                tmp_path.unlink(missing_ok=True)
                 return {"status": "error", "message": f"SHA256 mismatch (expected {expected_sha}, got {actual})"}
         if _SERVER_FILE.exists():
             shutil.copy2(_SERVER_FILE, _BACKUP_FILE)
@@ -147,8 +197,13 @@ def _updater_apply() -> dict[str, Any]:
             "backup": str(_BACKUP_FILE),
         }
     except Exception as e:
-        tmp_path.unlink(missing_ok=True)
         return {"status": "error", "message": str(e)}
+    finally:
+        # Idempotent: succeeds whether os.replace consumed the tmp or it's still present.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 mcp = FastMCP("nvidia-gpu")
@@ -157,7 +212,17 @@ mcp = FastMCP("nvidia-gpu")
 # Logging — file-based so users can debug "the AI says ok but I see nothing"
 # ---------------------------------------------------------------------------
 
-_LOG_FILE = Path(__file__).parent / "server.log"
+def _resolve_log_file() -> Path:
+    """Prefer next to server.py; fall back to %TEMP% on read-only mounts."""
+    primary = Path(__file__).parent / "server.log"
+    try:
+        primary.touch(exist_ok=True)
+        return primary
+    except Exception:
+        return Path(tempfile.gettempdir()) / "nvidia-mcp.log"
+
+
+_LOG_FILE = _resolve_log_file()
 logger = logging.getLogger("nvidia-mcp")
 if not logger.handlers:
     logger.setLevel(logging.INFO)
@@ -429,8 +494,18 @@ _OS_IDS: dict[str, int] = {
 }
 
 
+def _require_pynvml() -> None:
+    """Raise a clear error if pynvml is not importable on this system."""
+    if pynvml is None:
+        raise RuntimeError(
+            "pynvml not available. Install nvidia-ml-py and ensure an NVIDIA "
+            "driver is present (this server runs without it, but GPU tools fail)."
+        )
+
+
 def _get_gpu_info() -> tuple[str, str]:
     """Return (driver_version, gpu_name) via NVML."""
+    _require_pynvml()
     pynvml.nvmlInit()
     try:
         driver = pynvml.nvmlSystemGetDriverVersion()
@@ -897,7 +972,14 @@ def get_gpu_status(gpu_index: int = 0) -> dict:
     Args:
         gpu_index: Index of the GPU (default 0 for the first GPU).
     """
-    pynvml.nvmlInit()
+    if pynvml is None:
+        return {"error": "pynvml not available — install nvidia-ml-py + an NVIDIA driver."}
+    try:
+        pynvml.nvmlInit()
+    except Exception as exc:
+        # NVML shared library missing (e.g. running on macOS / Linux without the
+        # NVIDIA driver, or in CI). Return a structured error instead of crashing.
+        return {"error": f"NVML init failed: {exc}"}
     try:
         handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_index)
         name = pynvml.nvmlDeviceGetName(handle)
@@ -5104,6 +5186,50 @@ def _ps_json(script: str, timeout: int = 60) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Safe PowerShell helpers — bind untrusted args via env vars instead of
+# string interpolation. PowerShell substitutes `$env:NVMCP_ARG0` as a
+# string token, so a value like ` ; Remove-Item C:\` cannot break out
+# into a new command. Use these whenever ANY input could come from an
+# LLM or external source. The plain _ps / _ps_json helpers stay for
+# fully-static scripts.
+# ---------------------------------------------------------------------------
+
+def _ps_safe(script: str, args: list[str] | None = None, timeout: int = 30) -> str:
+    """Like `_ps`, but binds args via env vars (`$env:NVMCP_ARG0`, ...).
+
+    Args:
+        script: PowerShell source. Reference args as `$env:NVMCP_ARG0`,
+                `$env:NVMCP_ARG1`, etc.
+        args:   Values to bind. Each is set as a process-env var.
+    """
+    env = os.environ.copy()
+    if args:
+        for i, v in enumerate(args):
+            env[f"NVMCP_ARG{i}"] = "" if v is None else str(v)
+    r = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, timeout=timeout, env=env,
+    )
+    if r.returncode != 0 and r.stderr.strip():
+        raise RuntimeError(r.stderr.strip())
+    return r.stdout.strip()
+
+
+def _ps_safe_json(script: str, args: list[str] | None = None, timeout: int = 60) -> list[dict]:
+    """JSON-returning variant of `_ps_safe`."""
+    raw = _ps_safe(
+        f"({script}) | ConvertTo-Json -Depth 4 -Compress",
+        args=args, timeout=timeout,
+    )
+    if not raw:
+        return []
+    data = _json.loads(raw)
+    if isinstance(data, dict):
+        return [data]
+    return data
+
+
+# ---------------------------------------------------------------------------
 # 1. get_system_info
 # ---------------------------------------------------------------------------
 
@@ -5201,20 +5327,22 @@ def manage_processes(
     if action == "search":
         if not name:
             return {"error": "Parameter 'name' is required for search."}
-        procs = _ps_json(
-            f"Get-Process | Where-Object {{$_.ProcessName -like '*{name}*'}} "
-            f"| Select-Object ProcessName, Id, "
-            f"@{{N='CPU_s';E={{[math]::Round($_.CPU,1)}}}}, "
-            f"@{{N='MemoryMB';E={{[math]::Round($_.WorkingSet64/1MB,1)}}}}"
+        procs = _ps_safe_json(
+            "Get-Process | Where-Object {$_.ProcessName -like \"*$env:NVMCP_ARG0*\"} "
+            "| Select-Object ProcessName, Id, "
+            "@{N='CPU_s';E={[math]::Round($_.CPU,1)}}, "
+            "@{N='MemoryMB';E={[math]::Round($_.WorkingSet64/1MB,1)}}",
+            args=[name],
         )
         return {"matches": procs, "count": len(procs)}
 
     if action == "kill":
         if pid:
-            _ps(f"Stop-Process -Id {pid} -Force")
+            # pid is int, validated by FastMCP type-coercion — safe for f-string.
+            _ps(f"Stop-Process -Id {int(pid)} -Force")
             return {"status": "ok", "killed_pid": pid}
         if name:
-            _ps(f"Stop-Process -Name '{name}' -Force")
+            _ps_safe("Stop-Process -Name $env:NVMCP_ARG0 -Force", args=[name])
             return {"status": "ok", "killed_name": name}
         return {"error": "Provide 'pid' or 'name' to kill a process."}
 
@@ -5252,26 +5380,32 @@ def manage_services(
         return {"error": f"Parameter 'name' is required for action '{action}'."}
 
     if action == "status":
-        svcs = _ps_json(
-            f"Get-Service -Name '{name}' "
-            "| Select-Object Name, DisplayName, Status, StartType"
+        svcs = _ps_safe_json(
+            "Get-Service -Name $env:NVMCP_ARG0 "
+            "| Select-Object Name, DisplayName, Status, StartType",
+            args=[name],
         )
         return {"service": svcs[0] if svcs else {}}
 
     if action in ("start", "stop", "restart"):
         cmd_map = {
-            "start": f"Start-Service -Name '{name}'",
-            "stop": f"Stop-Service -Name '{name}' -Force",
-            "restart": f"Restart-Service -Name '{name}' -Force",
+            "start": "Start-Service -Name $env:NVMCP_ARG0",
+            "stop": "Stop-Service -Name $env:NVMCP_ARG0 -Force",
+            "restart": "Restart-Service -Name $env:NVMCP_ARG0 -Force",
         }
-        _ps(cmd_map[action])
-        new = _ps_json(
-            f"Get-Service -Name '{name}' | Select-Object Name, Status, StartType"
+        _ps_safe(cmd_map[action], args=[name])
+        new = _ps_safe_json(
+            "Get-Service -Name $env:NVMCP_ARG0 | Select-Object Name, Status, StartType",
+            args=[name],
         )
         return {"status": "ok", "service": new[0] if new else {}}
 
     if action == "set_startup":
-        _ps(f"Set-Service -Name '{name}' -StartupType '{startup_type}'")
+        # startup_type is constrained by Literal — safe to inline, but pass via env anyway
+        _ps_safe(
+            "Set-Service -Name $env:NVMCP_ARG0 -StartupType $env:NVMCP_ARG1",
+            args=[name, startup_type],
+        )
         return {"status": "ok", "name": name, "startup_type": startup_type}
 
     return {"error": f"Unknown action: {action}"}
@@ -5312,23 +5446,27 @@ def network_diagnostics(
     if action == "ping":
         if not target:
             return {"error": "Parameter 'target' is required for ping."}
-        results = _ps_json(
-            f"Test-Connection -ComputerName '{target}' -Count {count} "
+        results = _ps_safe_json(
+            "Test-Connection -ComputerName $env:NVMCP_ARG0 -Count $env:NVMCP_ARG1 "
             "| Select-Object Address, "
-            "@{N='ResponseTimeMs';E={$_.ResponseTime}}, StatusCode"
+            "@{N='ResponseTimeMs';E={$_.ResponseTime}}, StatusCode",
+            args=[target, str(int(count))],
         )
         return {"ping_results": results, "target": target}
 
     if action == "traceroute":
         if not target:
             return {"error": "Parameter 'target' is required for traceroute."}
-        raw = _ps(f"tracert -d -w 1000 {target}", timeout=60)
+        raw = _ps_safe(
+            "tracert -d -w 1000 $env:NVMCP_ARG0",
+            args=[target], timeout=60,
+        )
         return {"traceroute": raw, "target": target}
 
     if action == "dns":
         if not target:
             return {"error": "Parameter 'target' is required for dns."}
-        records = _ps_json(f"Resolve-DnsName '{target}'")
+        records = _ps_safe_json("Resolve-DnsName $env:NVMCP_ARG0", args=[target])
         return {"dns_records": records, "target": target}
 
     if action == "connections":
@@ -5409,7 +5547,11 @@ def manage_startup_programs(
     if action == "disable":
         for hive in [hklm, hkcu]:
             try:
-                _ps(f"Remove-ItemProperty -Path '{hive}' -Name '{name}' -ErrorAction Stop")
+                _ps_safe(
+                    "Remove-ItemProperty -Path $env:NVMCP_ARG0 "
+                    "-Name $env:NVMCP_ARG1 -ErrorAction Stop",
+                    args=[hive, name],
+                )
                 return {"status": "ok", "disabled": name, "hive": hive}
             except Exception:
                 continue
@@ -5516,15 +5658,19 @@ def manage_firewall(
         if not rule_name:
             return {"error": "Parameter 'rule_name' is required."}
         fw_action = "Allow" if allow else "Block"
+        # direction / protocol / fw_action come from Literal types — safe to inline.
+        # rule_name and program come from arbitrary input — bind via env vars.
         cmd = (
-            f"New-NetFirewallRule -DisplayName '{rule_name}' "
+            "New-NetFirewallRule -DisplayName $env:NVMCP_ARG0 "
             f"-Direction {direction} -Action {fw_action}"
         )
+        args = [rule_name]
         if port:
-            cmd += f" -Protocol {protocol} -LocalPort {port}"
+            cmd += f" -Protocol {protocol} -LocalPort {int(port)}"
         if program:
-            cmd += f" -Program '{program}'"
-        _ps(cmd)
+            cmd += " -Program $env:NVMCP_ARG1"
+            args.append(program)
+        _ps_safe(cmd, args=args)
         return {
             "status": "ok",
             "rule": rule_name,
@@ -5535,7 +5681,7 @@ def manage_firewall(
     if action == "remove_rule":
         if not rule_name:
             return {"error": "Parameter 'rule_name' is required."}
-        _ps(f"Remove-NetFirewallRule -DisplayName '{rule_name}'")
+        _ps_safe("Remove-NetFirewallRule -DisplayName $env:NVMCP_ARG0", args=[rule_name])
         return {"status": "ok", "removed": rule_name}
 
     if action in ("enable", "disable"):
@@ -5580,13 +5726,13 @@ def disk_analysis(
         return {"disks": disks}
 
     if action == "large_files":
-        files = _ps_json(
-            f"Get-ChildItem -Path '{path}' -Recurse -File -ErrorAction SilentlyContinue "
-            f"| Where-Object {{$_.Length -gt {min_size_mb}MB}} "
-            f"| Sort-Object Length -Descending "
-            f"| Select-Object -First {top_n} FullName, "
-            f"@{{N='SizeMB';E={{[math]::Round($_.Length/1MB,1)}}}}, LastWriteTime",
-            timeout=120,
+        files = _ps_safe_json(
+            "Get-ChildItem -Path $env:NVMCP_ARG0 -Recurse -File -ErrorAction SilentlyContinue "
+            f"| Where-Object {{$_.Length -gt {int(min_size_mb)}MB}} "
+            "| Sort-Object Length -Descending "
+            f"| Select-Object -First {int(top_n)} FullName, "
+            "@{N='SizeMB';E={[math]::Round($_.Length/1MB,1)}}, LastWriteTime",
+            args=[path], timeout=120,
         )
         return {"large_files": files, "count": len(files), "scanned_path": path}
 
@@ -5700,19 +5846,19 @@ def manage_installed_software(
         return {"error": f"Parameter 'name' is required for '{action}'."}
 
     if action == "search":
-        sw = _ps_json(
-            f"({query}) | Where-Object {{$_.DisplayName -like '*{name}*'}} "
+        sw = _ps_safe_json(
+            f"({query}) | Where-Object {{$_.DisplayName -like \"*$env:NVMCP_ARG0*\"}} "
             "| Select-Object DisplayName, DisplayVersion, Publisher, "
             "InstallDate, UninstallString",
-            timeout=30,
+            args=[name], timeout=30,
         )
         return {"matches": sw, "count": len(sw)}
 
     if action == "uninstall":
-        matches = _ps_json(
-            f"({query}) | Where-Object {{$_.DisplayName -like '*{name}*'}} "
+        matches = _ps_safe_json(
+            f"({query}) | Where-Object {{$_.DisplayName -like \"*$env:NVMCP_ARG0*\"}} "
             "| Select-Object DisplayName, UninstallString",
-            timeout=30,
+            args=[name], timeout=30,
         )
         if not matches:
             return {"error": f"No software found matching '{name}'."}
@@ -5727,7 +5873,12 @@ def manage_installed_software(
         # Run uninstaller silently
         if "msiexec" in uninstall_cmd.lower():
             uninstall_cmd = uninstall_cmd.replace("/I", "/X") + " /quiet /norestart"
-        _ps(f"Start-Process cmd -ArgumentList '/c {uninstall_cmd}' -Wait", timeout=120)
+        # uninstall_cmd comes from the registry (not user-controllable here),
+        # but bind via env var anyway for defense-in-depth.
+        _ps_safe(
+            "Start-Process cmd -ArgumentList \"/c $env:NVMCP_ARG0\" -Wait",
+            args=[uninstall_cmd], timeout=120,
+        )
         return {
             "status": "ok",
             "uninstalled": matches[0].get("DisplayName"),
@@ -5777,24 +5928,31 @@ def manage_users(
     if action == "add":
         if not password:
             return {"error": "Parameter 'password' is required to add a user."}
-        _ps(
-            f"$pw = ConvertTo-SecureString '{password}' -AsPlainText -Force;\n"
-            f"New-LocalUser -Name '{username}' -Password $pw -FullName '{username}'"
+        # Password + username via env vars: never appears in the command line,
+        # never goes through PowerShell parser-level expansion.
+        _ps_safe(
+            "$pw = ConvertTo-SecureString $env:NVMCP_ARG0 -AsPlainText -Force;\n"
+            "New-LocalUser -Name $env:NVMCP_ARG1 -Password $pw -FullName $env:NVMCP_ARG1",
+            args=[password, username],
         )
         if admin:
-            _ps(f"Add-LocalGroupMember -Group 'Administrators' -Member '{username}'")
+            _ps_safe(
+                "Add-LocalGroupMember -Group 'Administrators' -Member $env:NVMCP_ARG0",
+                args=[username],
+            )
         return {"status": "ok", "created": username, "admin": admin}
 
     if action == "remove":
-        _ps(f"Remove-LocalUser -Name '{username}'")
+        _ps_safe("Remove-LocalUser -Name $env:NVMCP_ARG0", args=[username])
         return {"status": "ok", "removed": username}
 
     if action == "set_password":
         if not password:
             return {"error": "Parameter 'password' is required."}
-        _ps(
-            f"$pw = ConvertTo-SecureString '{password}' -AsPlainText -Force;\n"
-            f"Set-LocalUser -Name '{username}' -Password $pw"
+        _ps_safe(
+            "$pw = ConvertTo-SecureString $env:NVMCP_ARG0 -AsPlainText -Force;\n"
+            "Set-LocalUser -Name $env:NVMCP_ARG1 -Password $pw",
+            args=[password, username],
         )
         return {"status": "ok", "username": username, "password_updated": True}
 
@@ -5839,38 +5997,43 @@ def manage_scheduled_tasks(
     if action == "create":
         if not program:
             return {"error": "Parameter 'program' is required for 'create'."}
+        # `time` is bound as $env:NVMCP_ARG3 (or unused for hourly/at_logon).
         trigger_map = {
-            "daily": f"New-ScheduledTaskTrigger -Daily -At '{time}'",
-            "weekly": f"New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At '{time}'",
+            "daily": "New-ScheduledTaskTrigger -Daily -At $env:NVMCP_ARG3",
+            "weekly": "New-ScheduledTaskTrigger -Weekly -DaysOfWeek Monday -At $env:NVMCP_ARG3",
             "hourly": "New-ScheduledTaskTrigger -Once -At '00:00' "
                       "-RepetitionInterval (New-TimeSpan -Hours 1)",
             "at_logon": "New-ScheduledTaskTrigger -AtLogon",
-            "once": f"New-ScheduledTaskTrigger -Once -At '{time}'",
+            "once": "New-ScheduledTaskTrigger -Once -At $env:NVMCP_ARG3",
         }
         trigger_cmd = trigger_map.get(schedule, trigger_map["daily"])
-        args_part = f" -Argument '{arguments}'" if arguments else ""
-        _ps(
-            f"$action = New-ScheduledTaskAction -Execute '{program}'{args_part};\n"
+        args_part = " -Argument $env:NVMCP_ARG2" if arguments else ""
+        _ps_safe(
+            f"$action = New-ScheduledTaskAction -Execute $env:NVMCP_ARG1{args_part};\n"
             f"$trigger = {trigger_cmd};\n"
-            f"Register-ScheduledTask -TaskName '{task_name}' "
-            f"-Action $action -Trigger $trigger -RunLevel Highest"
+            "Register-ScheduledTask -TaskName $env:NVMCP_ARG0 "
+            "-Action $action -Trigger $trigger -RunLevel Highest",
+            args=[task_name, program, arguments, time],
         )
         return {"status": "ok", "created": task_name, "schedule": schedule}
 
     if action == "delete":
-        _ps(f"Unregister-ScheduledTask -TaskName '{task_name}' -Confirm:$false")
+        _ps_safe(
+            "Unregister-ScheduledTask -TaskName $env:NVMCP_ARG0 -Confirm:$false",
+            args=[task_name],
+        )
         return {"status": "ok", "deleted": task_name}
 
     if action == "run":
-        _ps(f"Start-ScheduledTask -TaskName '{task_name}'")
+        _ps_safe("Start-ScheduledTask -TaskName $env:NVMCP_ARG0", args=[task_name])
         return {"status": "ok", "started": task_name}
 
     if action == "disable":
-        _ps(f"Disable-ScheduledTask -TaskName '{task_name}'")
+        _ps_safe("Disable-ScheduledTask -TaskName $env:NVMCP_ARG0", args=[task_name])
         return {"status": "ok", "disabled": task_name}
 
     if action == "enable":
-        _ps(f"Enable-ScheduledTask -TaskName '{task_name}'")
+        _ps_safe("Enable-ScheduledTask -TaskName $env:NVMCP_ARG0", args=[task_name])
         return {"status": "ok", "enabled": task_name}
 
     return {"error": f"Unknown action: {action}"}
@@ -5880,6 +6043,11 @@ def manage_scheduled_tasks(
 # 13. run_shell_command  (catch-all for everything else)
 # ---------------------------------------------------------------------------
 
+def _shell_allowed() -> bool:
+    """run_shell_command is opt-in via env var to limit prompt-injection blast radius."""
+    return os.environ.get("NVIDIA_MCP_ALLOW_SHELL", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 @mcp.tool()
 def run_shell_command(
     command: str,
@@ -5888,14 +6056,33 @@ def run_shell_command(
 ) -> dict:
     """Execute an arbitrary shell command (PowerShell or CMD).
 
-    Use this as a fallback when no other tool covers the task.
-    Requires care – commands run with the same privileges as the MCP server.
+    DISABLED BY DEFAULT for security. Set environment variable
+    NVIDIA_MCP_ALLOW_SHELL=1 to enable. Every invocation is logged to
+    server.log. Use this only as a fallback when no other tool covers the
+    task; commands run with the same privileges as the MCP server, which
+    means a prompt-injection through any web page the LLM reads can pivot
+    into full RCE if this is enabled.
 
     Args:
         command: The command string to execute.
         use_powershell: True for PowerShell (default), False for CMD.
         timeout: Max seconds to wait (default 30).
     """
+    if not _shell_allowed():
+        return {
+            "error": (
+                "run_shell_command is disabled by default. Set environment "
+                "variable NVIDIA_MCP_ALLOW_SHELL=1 to enable."
+            ),
+            "hint": "Prefer the dedicated tools (manage_processes, manage_services, ...)",
+        }
+
+    # Audit log: every shell invocation lands in server.log so a user can
+    # forensically review what the LLM ran on their machine.
+    logger.warning(
+        "run_shell_command invoked (powershell=%s, timeout=%s): %s",
+        use_powershell, timeout, command[:1000],
+    )
     try:
         if use_powershell:
             r = subprocess.run(
@@ -5940,16 +6127,17 @@ _CDP_BASE = f"http://localhost:{_CDP_PORT}"
 # ── Low-level CDP helpers ──────────────────────────────────────────────────────
 
 def _cdp_ensure_chrome() -> bool:
-    """Ensure Chrome is reachable on the CDP debug port (Windows).
+    """Ensure Chrome is reachable on the CDP debug port.
 
-    Logic:
-    1. If CDP is already available → done.
-    2. If Chrome is running WITHOUT the debug port → terminate it via taskkill,
-       then relaunch with --remote-debugging-port.
-    3. If Chrome is not running at all → launch it fresh with the flag.
-    Returns True if CDP becomes available, False otherwise.
+    Strategy: launch a SEPARATE Chrome instance with an isolated user-data-dir
+    so we never interfere with the user's regular Chrome session. Previous
+    versions taskkilled all chrome.exe (destroying open tabs / typed text);
+    that behavior is gone.
+
+    Override the isolated profile with `NVIDIA_MCP_CDP_USE_MAIN_PROFILE=1`
+    (legacy behavior, will kill+relaunch user's main Chrome).
     """
-    # ── 1. Already available? ─────────────────────────────────────────────────
+    # Already available?
     try:
         resp = httpx.get(f"{_CDP_BASE}/json/version", timeout=2)
         if resp.status_code == 200:
@@ -5957,7 +6145,6 @@ def _cdp_ensure_chrome() -> bool:
     except Exception:
         pass
 
-    # ── Windows Chrome install locations ─────────────────────────────────────
     _CHROME_PATHS = [
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
@@ -5967,43 +6154,58 @@ def _cdp_ensure_chrome() -> bool:
     ]
     chrome_bin = next((p for p in _CHROME_PATHS if Path(p).exists()), None)
     if not chrome_bin:
-        return False   # Chrome not installed
+        return False
 
-    # ── 2. Chrome running without debug port → terminate via taskkill ────────
-    try:
-        chk = subprocess.run(
-            ["tasklist", "/fi", "IMAGENAME eq chrome.exe", "/fo", "csv", "/nh"],
-            capture_output=True, text=True,
-        )
-        if "chrome.exe" in chk.stdout.lower():
-            # Gracefully close all Chrome windows first, then force-kill remainder
-            subprocess.run(
-                ["taskkill", "/im", "chrome.exe"],
-                capture_output=True,
-            )
-            _time.sleep(1)
-            subprocess.run(
-                ["taskkill", "/f", "/im", "chrome.exe"],
-                capture_output=True,
-            )
-            _time.sleep(1)
-    except Exception:
-        pass
+    use_main = os.environ.get("NVIDIA_MCP_CDP_USE_MAIN_PROFILE", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    )
 
-    # ── 3. Launch Chrome with remote-debugging-port ───────────────────────────
+    if use_main:
+        # Legacy path: taskkill any existing Chrome and relaunch with the user's profile.
+        try:
+            chk = subprocess.run(
+                ["tasklist", "/fi", "IMAGENAME eq chrome.exe", "/fo", "csv", "/nh"],
+                capture_output=True, text=True,
+            )
+            if "chrome.exe" in chk.stdout.lower():
+                subprocess.run(["taskkill", "/im", "chrome.exe"], capture_output=True)
+                _time.sleep(1)
+                subprocess.run(["taskkill", "/f", "/im", "chrome.exe"], capture_output=True)
+                _time.sleep(1)
+        except Exception:
+            pass
+        cmd = [
+            chrome_bin,
+            f"--remote-debugging-port={_CDP_PORT}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--restore-last-session",
+        ]
+    else:
+        # Default: dedicated user-data-dir, leaves the user's main Chrome alone.
+        cdp_profile = Path(os.environ.get("LOCALAPPDATA", "") or tempfile.gettempdir()) \
+            / "GameCopilot" / "chrome-cdp"
+        try:
+            cdp_profile.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            cdp_profile = Path(tempfile.gettempdir()) / "nvidia-mcp-chrome-cdp"
+            cdp_profile.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            chrome_bin,
+            f"--remote-debugging-port={_CDP_PORT}",
+            f"--user-data-dir={cdp_profile}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ]
+
     subprocess.Popen(
-        [chrome_bin,
-         f"--remote-debugging-port={_CDP_PORT}",
-         "--no-first-run",
-         "--no-default-browser-check",
-         "--restore-last-session"],
+        cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         **( {"creationflags": subprocess.CREATE_NO_WINDOW}
             if platform.system() == "Windows" else {} ),
     )
 
-    # Wait up to 8 s for CDP to become available
     for _ in range(16):
         _time.sleep(0.5)
         try:
@@ -6080,6 +6282,19 @@ def _cdp_js(ws_url: str, js: str, timeout: int = 15) -> str:
     if val.get("type") == "string":
         return val.get("value", "")
     return str(val.get("value", ""))
+
+
+def _cdp_js_call(ws_url: str, fn_source: str, args: list[Any] | None = None,
+                 timeout: int = 15) -> str:
+    """Call a JS function with arguments, JSON-encoding args (no string interpolation).
+
+    `fn_source` is a JS function literal, e.g. "(sel) => document.querySelector(sel).click()".
+    Args are JSON-serialized and bound positionally — that's safe because JSON values
+    are JS-literal-safe (the JSON encoder escapes quotes / control chars).
+    """
+    args_json = _json.dumps(args or [])
+    expression = f"({fn_source}).apply(null, {args_json})"
+    return _cdp_js(ws_url, expression, timeout=timeout)
 
 
 def _cdp_navigate(ws_url: str, url: str, timeout: int = 15) -> None:
@@ -6254,31 +6469,29 @@ def browser_click(
     if not ws:
         return {"error": "Kein Chrome-Tab verfügbar. Erst browser_navigate aufrufen."}
 
-    if selector:
-        js_code = f"""
-        (function(){{
-            var el = document.querySelector('{selector}');
-            if(el) {{ el.click(); return 'clicked: ' + (el.innerText||'').trim().substring(0,50); }}
-            return 'not-found: {selector}';
-        }})()
-        """
-    else:
-        safe_text = text.replace("'", "\\'")
-        js_code = f"""
-        (function(){{
-            var all = document.querySelectorAll('a,button,[role="button"],input[type="submit"]');
-            for(var i=0; i<all.length; i++){{
-                var t = (all[i].innerText||all[i].value||'').trim().toLowerCase();
-                if(t.includes('{safe_text}'.toLowerCase())){{
-                    all[i].click();
-                    return 'clicked: ' + (all[i].innerText||all[i].value||'').trim().substring(0,50);
-                }}
-            }}
-            return 'not-found: {safe_text}';
-        }})()
-        """
-
-    result = _cdp_js(ws, js_code)
+    # JSON-encoded args, no string interpolation into the JS source — a value
+    # like  ');alert(1);//  is just a string literal to V8.
+    fn_source = """
+    function(selector, text){
+        if (selector) {
+            try { var el = document.querySelector(selector); }
+            catch (e) { return 'invalid-selector: ' + selector; }
+            if (el) { el.click(); return 'clicked: ' + (el.innerText||'').trim().substring(0,50); }
+            return 'not-found: ' + selector;
+        }
+        var needle = (text||'').toLowerCase();
+        var all = document.querySelectorAll('a,button,[role="button"],input[type="submit"]');
+        for (var i=0; i<all.length; i++) {
+            var t = (all[i].innerText||all[i].value||'').trim().toLowerCase();
+            if (t.includes(needle)) {
+                all[i].click();
+                return 'clicked: ' + (all[i].innerText||all[i].value||'').trim().substring(0,50);
+            }
+        }
+        return 'not-found: ' + needle;
+    }
+    """
+    result = _cdp_js_call(ws, fn_source, [selector, text])
     return {"status": "ok" if "clicked" in result else "not_found", "result": result}
 
 
@@ -6303,25 +6516,20 @@ def browser_type(
     if not ws:
         return {"error": "Kein Chrome-Tab verfügbar."}
 
-    safe_text = text.replace("\\", "\\\\").replace("'", "\\'")
-    submit_code = (
-        "el.form && el.form.submit();"
-        if submit else ""
-    )
-    js_code = f"""
-    (function(){{
-        var el = document.querySelector('{selector}');
-        if(!el) return 'not-found: {selector}';
+    fn_source = """
+    function(selector, text, submit){
+        try { var el = document.querySelector(selector); }
+        catch (e) { return 'invalid-selector: ' + selector; }
+        if (!el) return 'not-found: ' + selector;
         el.focus();
-        el.value = '{safe_text}';
-        el.dispatchEvent(new Event('input', {{bubbles:true}}));
-        el.dispatchEvent(new Event('change', {{bubbles:true}}));
-        {submit_code}
-        return 'typed: ' + '{safe_text}'.substring(0,3) + '***';
-    }})()
+        el.value = text;
+        el.dispatchEvent(new Event('input', {bubbles:true}));
+        el.dispatchEvent(new Event('change', {bubbles:true}));
+        if (submit && el.form) el.form.submit();
+        return 'typed: ' + (text||'').substring(0,3) + '***';
+    }
     """
-
-    result = _cdp_js(ws, js_code)
+    result = _cdp_js_call(ws, fn_source, [selector, text, bool(submit)])
     return {"status": "ok" if "typed" in result else "not_found", "result": result}
 
 
@@ -9716,6 +9924,109 @@ def get_nvidia_mcp_server_version() -> dict:
     DO NOT USE THIS for the NVIDIA driver version, GPU info, or any other software version.
     """
     return {"version": __version__, "repo": _GITHUB_REPO}
+
+
+# ---------------------------------------------------------------------------
+# MCP Resources — read-only views the LLM can pull without a tool call.
+# Saves tokens for "show me my config" style queries.
+# ---------------------------------------------------------------------------
+
+@mcp.resource("nvidia-mcp://version")
+def _resource_version() -> str:
+    """Current running nvidia-mcp version + repo."""
+    return _json.dumps({"version": __version__, "repo": _GITHUB_REPO}, indent=2)
+
+
+@mcp.resource("nvidia-mcp://changelog")
+def _resource_changelog() -> str:
+    """Full CHANGELOG.md of the nvidia-mcp server."""
+    p = Path(__file__).parent / "CHANGELOG.md"
+    try:
+        return p.read_text(encoding="utf-8")
+    except Exception as exc:
+        return f"(CHANGELOG.md unavailable: {exc})"
+
+
+@mcp.resource("nvidia-mcp://gpu-status")
+def _resource_gpu_status() -> str:
+    """Live GPU status snapshot (JSON) — temperature, utilization, VRAM."""
+    return _json.dumps(get_gpu_status(0), indent=2, ensure_ascii=False)
+
+
+@mcp.resource("nvidia-mcp://msfs-usercfg")
+def _resource_msfs_usercfg() -> str:
+    """Full text of the active MSFS 2024 UserCfg.opt."""
+    cfg = _find_usercfg()
+    if cfg is None:
+        return "(UserCfg.opt not found — run diagnose_msfs_config to locate it)"
+    try:
+        header = f"# {cfg}\n"
+        return header + cfg.read_text(encoding="utf-8", errors="ignore")
+    except Exception as exc:
+        return f"(UserCfg.opt unreadable: {exc})"
+
+
+@mcp.resource("nvidia-mcp://server-log")
+def _resource_server_log() -> str:
+    """Tail of server.log (last ~200 lines) for forensic review."""
+    try:
+        text = _LOG_FILE.read_text(encoding="utf-8", errors="ignore")
+        lines = text.splitlines()
+        return "\n".join(lines[-200:])
+    except Exception as exc:
+        return f"(server.log unreadable: {exc})"
+
+
+# ---------------------------------------------------------------------------
+# MCP Prompts — canned multi-step playbooks. The host UI can offer these as
+# "starter prompts" so the user doesn't have to remember tool ordering.
+# ---------------------------------------------------------------------------
+
+@mcp.prompt()
+def optimize_msfs_for_vr(gpu_tier: str = "auto") -> str:
+    """Walk through MSFS 2024 + Pimax + OpenXR optimization for a VR session.
+
+    Args:
+        gpu_tier: 'flagship', 'high_end', 'mid_high', 'mid_range', 'entry' or 'auto'.
+    """
+    return (
+        "Optimize my Microsoft Flight Simulator 2024 setup for VR with my Pimax headset.\n"
+        f"GPU tier: {gpu_tier} (use auto-detection if 'auto').\n\n"
+        "Do these steps in order, calling the right tools and reporting results:\n"
+        "1. `get_gpu_status` — confirm GPU model + free VRAM.\n"
+        "2. `diagnose_msfs_config` — validate UserCfg.opt is present and well-formed.\n"
+        "3. `analyze_msfs_graphics` — read current graphics settings.\n"
+        "4. `optimize_msfs_graphics` with dry_run=true first; ASK before applying.\n"
+        "5. `analyze_pimax_settings`, then `optimize_pimax_settings` if applicable.\n"
+        "6. `analyze_openxr`, then `apply_openxr_preset` for the matching tier.\n"
+        "7. Summarize what changed and what the user should test in-flight."
+    )
+
+
+@mcp.prompt()
+def diagnose_msfs_issue() -> str:
+    """Systematic MSFS 2024 diagnosis when something feels broken (low FPS, crashes, missing UI)."""
+    return (
+        "The user reports an issue with MSFS 2024. Diagnose systematically:\n"
+        "1. Ask the user for the SYMPTOM (low FPS, crash, black screen, missing menus, ...).\n"
+        "2. `get_gpu_status` — utilization + temperature in expected range?\n"
+        "3. `diagnose_msfs_config` — UserCfg.opt valid? backups present?\n"
+        "4. `manage_processes` action='search' name='FlightSim' — actually running?\n"
+        "5. `get_system_info` — RAM headroom OK? CPU not pegged?\n"
+        "6. `check_and_install_driver` — driver current?\n"
+        "Then choose `fix_msfs` actions based on the symptom."
+    )
+
+
+@mcp.prompt()
+def check_for_server_updates() -> str:
+    """Check whether a newer nvidia-mcp release is available and offer to install."""
+    return (
+        "Run `check_nvidia_mcp_server_update`. If a newer version is available, "
+        "summarize the changelog briefly and ASK the user before calling "
+        "`install_nvidia_mcp_server_update`. Mention that a server restart is "
+        "needed after installation."
+    )
 
 
 if __name__ == "__main__":
